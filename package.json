@@ -1,0 +1,15 @@
+{
+  "name": "codex-airpod",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Control Codex Voice mute with an AirPods gesture",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "launch": "node src/launch.cjs",
+    "check": "set -e; for file in src/*.cjs test/*.cjs; do node --check \"$file\"; done; zsh -n launch.command",
+    "test": "node --test test/*.test.cjs"
+  }
+}
