@@ -25,8 +25,6 @@ test("runtime contains no process/system mute or capture-stop path", () => {
     "AudioObjectSetPropertyData",
     "CoreAudio.framework",
     "pmin",
-    "setInputMuted",
-    "isInputMuted",
     "voiceProcessingInputMuted",
     "stopCapture",
     "stopRecording",
@@ -37,6 +35,24 @@ test("runtime contains no process/system mute or capture-stop path", () => {
       allSource.includes(forbidden),
       false,
       `forbidden runtime path: ${forbidden}`,
+    );
+  }
+});
+
+test("AVAudioApplication mute state is confined to the native adapter", () => {
+  const nativeSource = sources.find(
+    ({ name }) => name === "native-gesture.cjs",
+  )?.source;
+  assert.equal(typeof nativeSource, "string");
+  assert.equal(nativeSource.includes("isInputMuted"), true);
+  assert.equal(nativeSource.includes("setInputMuted$error$"), true);
+
+  for (const { name, source } of sources) {
+    if (name === "native-gesture.cjs") continue;
+    assert.equal(
+      /\bisInputMuted\b|setInputMuted\$error\$/.test(source),
+      false,
+      `AVAudioApplication mute access escaped native adapter: ${name}`,
     );
   }
 });

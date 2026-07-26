@@ -10,6 +10,8 @@ const FOUNDATION =
   "/System/Library/Frameworks/Foundation.framework/Foundation";
 const HANDLER_METHOD =
   "setInputMuteStateChangeHandler$error$";
+const INPUT_MUTED = "isInputMuted";
+const SET_INPUT_MUTED = "setInputMuted$error$";
 const ADD_OBSERVER =
   "addObserverForName$object$queue$usingBlock$";
 const REMOVE_OBSERVER = "removeObserver$";
@@ -56,6 +58,8 @@ async function createNativeGestureAdapter({
   if (
     !audioApplication ||
     !(HANDLER_METHOD in audioApplication) ||
+    !(INPUT_MUTED in audioApplication) ||
+    !(SET_INPUT_MUTED in audioApplication) ||
     !notificationCenter ||
     !(ADD_OBSERVER in notificationCenter) ||
     !(REMOVE_OBSERVER in notificationCenter) ||
@@ -66,7 +70,9 @@ async function createNativeGestureAdapter({
 
   let disposed = false;
   let registered = false;
+  let acceptingRequests = false;
   let observerToken = null;
+  let synchronizingTarget = null;
   let retained;
 
   const notificationObserver = typedBlock(
@@ -77,8 +83,13 @@ async function createNativeGestureAdapter({
   const handler = typedBlock(
     { returns: "B", args: ["B"] },
     (inputShouldBeMuted) => {
+      const requested = Boolean(inputShouldBeMuted);
+      if (!acceptingRequests) return false;
+      if (synchronizingTarget !== null) {
+        return requested === synchronizingTarget;
+      }
       try {
-        return onRequest(Boolean(inputShouldBeMuted)) === true;
+        return onRequest(requested) === true;
       } catch {
         return false;
       }
@@ -105,9 +116,13 @@ async function createNativeGestureAdapter({
 
   function register() {
     if (disposed) return false;
-    if (registered) return true;
+    if (registered) {
+      acceptingRequests = true;
+      return true;
+    }
     if (!addObserver()) return false;
 
+    acceptingRequests = false;
     try {
       registered = Boolean(
         audioApplication[HANDLER_METHOD](handler, null),
@@ -122,14 +137,17 @@ async function createNativeGestureAdapter({
         // Registration remains failed closed.
       }
     }
+    acceptingRequests = registered;
     return registered;
   }
 
   function unregister() {
     if (!registered) {
+      acceptingRequests = false;
       removeObserver();
       return true;
     }
+    acceptingRequests = false;
     const removed = Boolean(
       audioApplication[HANDLER_METHOD](null, null),
     );
@@ -138,6 +156,33 @@ async function createNativeGestureAdapter({
       removeObserver();
     }
     return removed;
+  }
+
+  function synchronizeInputMuted(inputMuted) {
+    if (disposed || !registered || !acceptingRequests) {
+      return false;
+    }
+
+    const requested = Boolean(inputMuted);
+    try {
+      if (
+        Boolean(audioApplication[INPUT_MUTED]()) === requested
+      ) {
+        return true;
+      }
+
+      synchronizingTarget = requested;
+      try {
+        return (
+          audioApplication[SET_INPUT_MUTED](requested, null) ===
+          true
+        );
+      } finally {
+        synchronizingTarget = null;
+      }
+    } catch {
+      return false;
+    }
   }
 
   // objc-js proxies and blocks must remain live for native callbacks.
@@ -162,12 +207,15 @@ async function createNativeGestureAdapter({
           removeObserver();
         } finally {
           registered = false;
+          acceptingRequests = false;
+          synchronizingTarget = null;
           disposed = true;
           retained = null;
         }
       }
     },
     register,
+    synchronizeInputMuted,
     unregister,
   };
 }

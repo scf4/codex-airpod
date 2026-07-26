@@ -25,10 +25,12 @@ function voiceSnapshot({
 function harness({
   initialSnapshot = voiceSnapshot(),
   control = () => true,
+  synchronize = () => true,
   now = () => 0,
   confirmMs = 2_500,
 } = {}) {
   let snapshot = initialSnapshot;
+  let lifecycle;
   const nativeCalls = [];
   const controls = [];
   const nativeGesture = {
@@ -40,6 +42,13 @@ function harness({
       nativeCalls.push(["unregister"]);
       return true;
     },
+    synchronizeInputMuted(muted) {
+      nativeCalls.push(["synchronize", muted]);
+      return synchronize(
+        muted,
+        (requested) => lifecycle.handleRequest(requested),
+      );
+    },
   };
   const coordinator = {
     getSnapshot: () => snapshot,
@@ -48,7 +57,7 @@ function harness({
       return control(locator, command);
     },
   };
-  const lifecycle = createVoiceMuteLifecycle({
+  lifecycle = createVoiceMuteLifecycle({
     getCoordinator: () => coordinator,
     nativeGesture,
     now,
@@ -88,30 +97,103 @@ test("AirPods requests use only the exact canonical Codex command", () => {
   app.lifecycle.tick();
 });
 
-test("same pending request coalesces while the opposite is dispatched", () => {
+test("same pending request coalesces while the opposite is rejected", () => {
   const app = harness();
   app.lifecycle.tick();
 
   assert.equal(app.lifecycle.handleRequest(true), true);
   assert.equal(app.lifecycle.handleRequest(true), true);
   assert.equal(app.controls.length, 1);
-  assert.equal(app.lifecycle.handleRequest(false), true);
-  assert.equal(app.controls.length, 2);
-  assert.deepEqual(app.controls[1].command, {
-    type: "set-microphone-muted",
-    muted: false,
-  });
+  assert.equal(app.lifecycle.handleRequest(false), false);
+  assert.equal(app.controls.length, 1);
 });
 
-test("UI-originated mute changes produce no native call or redispatch", () => {
+test("same-state AirPods requests still traverse the Codex owner path", () => {
+  const app = harness({
+    initialSnapshot: voiceSnapshot({ microphoneMuted: true }),
+  });
+  app.lifecycle.tick();
+
+  assert.equal(app.lifecycle.handleRequest(true), true);
+  assert.deepEqual(app.controls, [
+    {
+      locator: {
+        hostId: "local",
+        conversationId: "conversation",
+      },
+      command: {
+        type: "set-microphone-muted",
+        muted: true,
+      },
+    },
+  ]);
+});
+
+test("initial and UI-originated Codex state synchronize Apple without redispatch", () => {
   const app = harness();
   app.lifecycle.tick();
-  assert.deepEqual(app.nativeCalls, [["register"]]);
+  assert.deepEqual(app.nativeCalls, [
+    ["register"],
+    ["synchronize", false],
+  ]);
 
   app.setSnapshot(voiceSnapshot({ microphoneMuted: true }));
   app.lifecycle.tick();
-  assert.deepEqual(app.nativeCalls, [["register"]]);
+  assert.deepEqual(app.nativeCalls, [
+    ["register"],
+    ["synchronize", false],
+    ["synchronize", true],
+  ]);
   assert.deepEqual(app.controls, []);
+});
+
+test("stale committed snapshots are not mirrored while a request is pending", () => {
+  const app = harness();
+  app.lifecycle.tick();
+  assert.equal(app.lifecycle.handleRequest(true), true);
+
+  app.lifecycle.tick();
+  assert.deepEqual(app.nativeCalls, [
+    ["register"],
+    ["synchronize", false],
+  ]);
+
+  app.setSnapshot(voiceSnapshot({ microphoneMuted: true }));
+  app.lifecycle.tick();
+  assert.deepEqual(app.nativeCalls, [
+    ["register"],
+    ["synchronize", false],
+    ["synchronize", true],
+  ]);
+});
+
+test("a replacement Voice session drops pending state and synchronizes its snapshot", () => {
+  const app = harness();
+  app.lifecycle.tick();
+  assert.equal(app.lifecycle.handleRequest(true), true);
+
+  app.setSnapshot(
+    voiceSnapshot({
+      hostId: "replacement",
+      conversationId: "other-conversation",
+      microphoneMuted: false,
+    }),
+  );
+  app.lifecycle.tick();
+
+  assert.deepEqual(app.nativeCalls, [
+    ["register"],
+    ["synchronize", false],
+    ["unregister"],
+    ["register"],
+    ["synchronize", false],
+  ]);
+  assert.equal(app.lifecycle.handleRequest(true), true);
+  assert.equal(app.controls.length, 2);
+  assert.deepEqual(app.controls[1].locator, {
+    hostId: "replacement",
+    conversationId: "other-conversation",
+  });
 });
 
 test("inactive or stopping Voice unregisters and rejects gestures", () => {
@@ -123,6 +205,7 @@ test("inactive or stopping Voice unregisters and rejects gestures", () => {
 
     assert.deepEqual(app.nativeCalls, [
       ["register"],
+      ["synchronize", false],
       ["unregister"],
     ]);
     assert.equal(app.lifecycle.handleRequest(true), false);
@@ -141,13 +224,14 @@ test("Codex rejection and exceptions fail closed for the session", () => {
     assert.equal(app.lifecycle.handleRequest(true), false);
     assert.deepEqual(app.nativeCalls, [
       ["register"],
+      ["synchronize", false],
       ["unregister"],
     ]);
     assert.equal(app.lifecycle.handleRequest(true), false);
   }
 });
 
-test("unconfirmed state disables the handler without a native mute write", () => {
+test("unconfirmed state restores committed Codex state before disabling", () => {
   let clock = 0;
   const app = harness({
     now: () => clock,
@@ -160,12 +244,28 @@ test("unconfirmed state disables the handler without a native mute write", () =>
   app.lifecycle.tick();
   assert.deepEqual(app.nativeCalls, [
     ["register"],
+    ["synchronize", false],
+    ["synchronize", false],
     ["unregister"],
   ]);
   assert.equal(app.lifecycle.handleRequest(true), false);
 });
 
-test("teardown only unregisters", () => {
+test("synchronization failure disables the current session", () => {
+  const app = harness({
+    synchronize: () => false,
+  });
+  app.lifecycle.tick();
+
+  assert.deepEqual(app.nativeCalls, [
+    ["register"],
+    ["synchronize", false],
+    ["unregister"],
+  ]);
+  assert.equal(app.lifecycle.handleRequest(true), false);
+});
+
+test("teardown unregisters after the initial synchronization", () => {
   const app = harness({
     initialSnapshot: voiceSnapshot({ microphoneMuted: true }),
   });
@@ -174,6 +274,7 @@ test("teardown only unregisters", () => {
   app.lifecycle.dispose();
   assert.deepEqual(app.nativeCalls, [
     ["register"],
+    ["synchronize", true],
     ["unregister"],
   ]);
 });

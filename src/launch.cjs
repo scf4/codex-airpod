@@ -17,6 +17,7 @@ const RUNTIME_FILES = [
   "lifecycle.cjs",
   "native-gesture.cjs",
   "preload.cjs",
+  "renderer.cjs",
 ];
 
 function hasFeature(argumentsList, switchName, feature) {

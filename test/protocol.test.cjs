@@ -38,7 +38,13 @@ test("launcher protocol is accepted by the preload", () => {
     attachToElectron(
       { app },
       capture,
-      { argumentsList: appArguments },
+      {
+        argumentsList: appArguments,
+        installRenderer: () => ({
+          dispose() {},
+          ready: new Promise(() => {}),
+        }),
+      },
     ),
     true,
   );

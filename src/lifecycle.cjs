@@ -41,7 +41,8 @@ function createVoiceMuteLifecycle({
   if (
     !nativeGesture ||
     typeof nativeGesture.register !== "function" ||
-    typeof nativeGesture.unregister !== "function"
+    typeof nativeGesture.unregister !== "function" ||
+    typeof nativeGesture.synchronizeInputMuted !== "function"
   ) {
     throw new TypeError("nativeGesture is incomplete");
   }
@@ -99,6 +100,18 @@ function createVoiceMuteLifecycle({
     unregister();
   }
 
+  function synchronize(snapshot) {
+    try {
+      return (
+        nativeGesture.synchronizeInputMuted(
+          snapshot.microphoneMuted,
+        ) === true
+      );
+    } catch {
+      return false;
+    }
+  }
+
   function activate(snapshot) {
     state.activeLocator = { ...snapshot.locator };
     state.disabled = false;
@@ -114,6 +127,10 @@ function createVoiceMuteLifecycle({
     }
     if (!accepted) {
       state.registered = false;
+      disable(snapshot);
+      return false;
+    }
+    if (!state.pending && !synchronize(snapshot)) {
       disable(snapshot);
       return false;
     }
@@ -161,16 +178,24 @@ function createVoiceMuteLifecycle({
         !sameLocator(state.activeLocator, snapshot.locator)
       ) {
         if (state.registered || state.activeLocator) deactivate();
-        if (!activate(snapshot)) return;
+        activate(snapshot);
+        return;
       }
 
-      if (!state.pending) return;
-      if (snapshot.microphoneMuted === state.pending.requested) {
+      if (!state.pending) {
+        if (!synchronize(snapshot)) disable(snapshot);
+        return;
+      }
+      if (
+        snapshot.microphoneMuted === state.pending.requested
+      ) {
         state.pending = null;
+        if (!synchronize(snapshot)) disable(snapshot);
         return;
       }
       if (now() >= state.pending.deadline) {
         state.pending = null;
+        synchronize(snapshot);
         disable(snapshot);
       }
     } finally {
@@ -229,8 +254,8 @@ function createVoiceMuteLifecycle({
     ) {
       return true;
     }
+    if (state.pending) return false;
 
-    const hadPending = Boolean(state.pending);
     let accepted = false;
     try {
       accepted =
@@ -244,11 +269,6 @@ function createVoiceMuteLifecycle({
     if (!accepted) {
       disableSoon(snapshot);
       return false;
-    }
-
-    if (!hadPending && snapshot.microphoneMuted === requested) {
-      state.pending = null;
-      return true;
     }
 
     state.pending = {

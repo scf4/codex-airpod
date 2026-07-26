@@ -11,6 +11,9 @@ const {
 const {
   createVoiceMuteLifecycle,
 } = require("./lifecycle.cjs");
+const {
+  installRendererAssetTransform,
+} = require("./renderer.cjs");
 
 const AUDIO_SERVICE_FEATURE = "AudioServiceOutOfProcess";
 const ELECTRON_HOOK = Symbol.for(
@@ -120,6 +123,7 @@ function attachToElectron(
   {
     createNative = createNativeGestureAdapter,
     createLifecycle = createVoiceMuteLifecycle,
+    installRenderer = installRendererAssetTransform,
     argumentsList = process.argv,
   } = {},
 ) {
@@ -151,18 +155,17 @@ function attachToElectron(
     lifecycle: null,
     nativeGesture: null,
     quitting: false,
+    rendererFailed: false,
+    rendererTransform: null,
   };
-  Object.defineProperty(app, APP_STATE, {
-    value: state,
-    configurable: false,
-  });
-
   function cleanup() {
     if (state.quitting) return;
     state.quitting = true;
     state.captureFailureUnsubscribe?.();
     state.captureFailureUnsubscribe = null;
     disposeRuntime();
+    state.rendererTransform?.dispose?.();
+    state.rendererTransform = null;
     capture.dispose();
   }
 
@@ -180,14 +183,42 @@ function attachToElectron(
     });
   }
 
+  let rendererTransform;
+  try {
+    rendererTransform = installRenderer(electron, {
+      onFailure() {
+        state.rendererFailed = true;
+        disposeRuntime();
+      },
+    });
+    state.rendererTransform = rendererTransform;
+  } catch {
+    cleanup();
+    return false;
+  }
+  if (
+    typeof rendererTransform?.ready?.then !== "function" ||
+    typeof rendererTransform.dispose !== "function"
+  ) {
+    cleanup();
+    return false;
+  }
+
+  Object.defineProperty(app, APP_STATE, {
+    value: state,
+    configurable: false,
+  });
   app.on("will-quit", cleanup);
 
   void app
     .whenReady()
     .then(async () => {
+      const rendererReady = await rendererTransform.ready;
       if (
+        !rendererReady ||
         state.quitting ||
         state.captureFailed ||
+        state.rendererFailed ||
         capture.getStatus() === "failed"
       ) {
         return;
@@ -198,7 +229,11 @@ function attachToElectron(
         onRequest: (requested) =>
           lifecycle?.handleRequest(requested) === true,
       });
-      if (state.quitting || state.captureFailed) {
+      if (
+        state.quitting ||
+        state.captureFailed ||
+        state.rendererFailed
+      ) {
         nativeGesture.dispose();
         return;
       }

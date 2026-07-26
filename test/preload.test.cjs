@@ -111,6 +111,7 @@ test("Electron lifecycle composes and cleans up once", async () => {
   let nativeDisposed = 0;
   let lifecycleDisposed = 0;
   let lifecycleStarted = 0;
+  let rendererDisposed = 0;
 
   assert.equal(
     attachToElectron(
@@ -134,6 +135,12 @@ test("Electron lifecycle composes and cleans up once", async () => {
             lifecycleStarted += 1;
           },
         }),
+        installRenderer: () => ({
+          dispose() {
+            rendererDisposed += 1;
+          },
+          ready: Promise.resolve(true),
+        }),
       },
     ),
     true,
@@ -144,6 +151,7 @@ test("Electron lifecycle composes and cleans up once", async () => {
   app.emit("will-quit");
   assert.equal(lifecycleDisposed, 1);
   assert.equal(nativeDisposed, 1);
+  assert.equal(rendererDisposed, 1);
   assert.equal(capture.disposed, 1);
 });
 
@@ -189,11 +197,159 @@ test("capture failure tears down an active native bridge", async () => {
         handleRequest: () => false,
         start() {},
       }),
+      installRenderer: () => ({
+        dispose() {},
+        ready: Promise.resolve(true),
+      }),
     },
   );
   await new Promise((resolve) => setImmediate(resolve));
 
   failCapture("source-mismatch");
+  assert.equal(lifecycleDisposed, 1);
+  assert.equal(nativeDisposed, 1);
+});
+
+test("renderer readiness gates native runtime creation", async () => {
+  const app = new EventEmitter();
+  app.commandLine = {
+    getSwitchValue(name) {
+      return name === "disable-features"
+        ? AUDIO_SERVICE_FEATURE
+        : "";
+    },
+  };
+  app.whenReady = () => Promise.resolve();
+  const capture = {
+    dispose() {},
+    getCoordinator: () => null,
+    getStatus: () => "waiting",
+  };
+  let resolveRenderer;
+  const ready = new Promise((resolve) => {
+    resolveRenderer = resolve;
+  });
+  let nativeCreated = 0;
+
+  attachToElectron(
+    { app },
+    capture,
+    {
+      createNative: async () => {
+        nativeCreated += 1;
+        return {
+          dispose() {},
+          register: () => true,
+          unregister: () => true,
+        };
+      },
+      createLifecycle: () => ({
+        dispose() {},
+        handleRequest: () => false,
+        start() {},
+      }),
+      installRenderer: () => ({
+        dispose() {},
+        ready,
+      }),
+    },
+  );
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(nativeCreated, 0);
+
+  resolveRenderer(true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(nativeCreated, 1);
+  app.emit("will-quit");
+});
+
+test("renderer rejection leaves the native runtime inactive", async () => {
+  const app = new EventEmitter();
+  app.commandLine = {
+    getSwitchValue(name) {
+      return name === "disable-features"
+        ? AUDIO_SERVICE_FEATURE
+        : "";
+    },
+  };
+  app.whenReady = () => Promise.resolve();
+  const capture = {
+    dispose() {},
+    getCoordinator: () => null,
+    getStatus: () => "waiting",
+  };
+  let nativeCreated = 0;
+
+  attachToElectron(
+    { app },
+    capture,
+    {
+      createNative: async () => {
+        nativeCreated += 1;
+        return {};
+      },
+      installRenderer: () => ({
+        dispose() {},
+        ready: Promise.resolve(false),
+      }),
+    },
+  );
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(nativeCreated, 0);
+  app.emit("will-quit");
+});
+
+test("renderer failure tears down an active native bridge", async () => {
+  const app = new EventEmitter();
+  app.commandLine = {
+    getSwitchValue(name) {
+      return name === "disable-features"
+        ? AUDIO_SERVICE_FEATURE
+        : "";
+    },
+  };
+  app.whenReady = () => Promise.resolve();
+  const capture = {
+    dispose() {},
+    getCoordinator: () => null,
+    getStatus: () => "captured",
+  };
+  let failRenderer;
+  let lifecycleDisposed = 0;
+  let nativeDisposed = 0;
+
+  attachToElectron(
+    { app },
+    capture,
+    {
+      createNative: async () => ({
+        dispose() {
+          nativeDisposed += 1;
+        },
+        register: () => true,
+        unregister: () => true,
+      }),
+      createLifecycle: () => ({
+        dispose() {
+          lifecycleDisposed += 1;
+        },
+        handleRequest: () => false,
+        start() {},
+      }),
+      installRenderer: (_electron, { onFailure }) => {
+        failRenderer = onFailure;
+        return {
+          dispose() {},
+          ready: Promise.resolve(true),
+        };
+      },
+    },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  failRenderer("source-mismatch");
   assert.equal(lifecycleDisposed, 1);
   assert.equal(nativeDisposed, 1);
 });
