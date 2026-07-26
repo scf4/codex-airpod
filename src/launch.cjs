@@ -1,56 +1,48 @@
 "use strict";
 
-const { spawn, execFile } = require("node:child_process");
+const { execFile, spawn } = require("node:child_process");
 const { lstat } = require("node:fs/promises");
 const path = require("node:path");
 const { promisify } = require("node:util");
-const {
-  PROFILE,
-  appPaths,
-} = require("./build-profile.cjs");
 
 const execFileAsync = promisify(execFile);
 const AUDIO_SERVICE_FEATURE = "AudioServiceOutOfProcess";
+const PROFILE = Object.freeze({
+  appPath: "/Applications/ChatGPT.app",
+  appIdentifier: "com.openai.codex",
+  appTeamIdentifier: "2DC432GLL2",
+});
 const RUNTIME_FILES = [
-  "build-profile.cjs",
-  "coordinator.cjs",
-  "lifecycle.cjs",
-  "native-gesture.cjs",
+  "airpods.cjs",
+  "launch.cjs",
   "preload.cjs",
-  "renderer.cjs",
+  "transforms.cjs",
 ];
 
-function hasFeature(argumentsList, switchName, feature) {
-  return argumentsList.some((argument) => {
-    if (
-      typeof argument !== "string" ||
-      !argument.startsWith(`--${switchName}=`)
-    ) {
-      return false;
-    }
-    return argument
-      .slice(`--${switchName}=`.length)
-      .split(",")
-      .map((item) => item.trim())
-      .includes(feature);
-  });
+function featureList(value) {
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
 }
 
-function withDisabledFeature(argumentsList, feature) {
+function hasFeature(args, switchName, feature) {
+  const prefix = `--${switchName}=`;
+  return args.some((argument) =>
+    typeof argument === "string" &&
+    argument.startsWith(prefix) &&
+    featureList(argument.slice(prefix.length)).includes(feature),
+  );
+}
+
+function withDisabledFeature(args, feature) {
   let merged = false;
-  const result = argumentsList.map((argument) => {
-    if (
-      typeof argument !== "string" ||
-      !argument.startsWith("--disable-features=")
-    ) {
+  const result = args.map((argument) => {
+    if (typeof argument !== "string" ||
+        !argument.startsWith("--disable-features=")) {
       return argument;
     }
     merged = true;
-    const features = argument
-      .slice("--disable-features=".length)
-      .split(",")
-      .map((item) => item.trim())
-      .filter(Boolean);
+    const features = featureList(
+      argument.slice("--disable-features=".length),
+    );
     if (!features.includes(feature)) features.push(feature);
     return `--disable-features=${features.join(",")}`;
   });
@@ -60,45 +52,28 @@ function withDisabledFeature(argumentsList, feature) {
 
 function parseArguments(argumentsList) {
   const checkOnly = argumentsList.includes("--check");
-  const forwarded = argumentsList.filter(
-    (argument) => argument !== "--check",
-  );
-  if (
-    hasFeature(
-      forwarded,
-      "enable-features",
-      AUDIO_SERVICE_FEATURE,
-    )
-  ) {
-    throw new Error(
-      `Cannot enable ${AUDIO_SERVICE_FEATURE} in AirPods mute mode`,
-    );
+  const forwarded = argumentsList.filter((argument) => argument !== "--check");
+  if (hasFeature(forwarded, "enable-features", AUDIO_SERVICE_FEATURE)) {
+    throw new Error(`Cannot enable ${AUDIO_SERVICE_FEATURE} in AirPods mute mode`);
   }
   return {
     checkOnly,
-    appArguments: withDisabledFeature(
-      forwarded,
-      AUDIO_SERVICE_FEATURE,
-    ),
+    appArguments: withDisabledFeature(forwarded, AUDIO_SERVICE_FEATURE),
   };
 }
 
 function createEnvironment(base, { preloadPath }) {
   const environment = { ...base };
   delete environment.ELECTRON_RUN_AS_NODE;
-  environment.NODE_OPTIONS =
-    `--require=${JSON.stringify(preloadPath)}`;
+  environment.NODE_OPTIONS = `--require=${JSON.stringify(preloadPath)}`;
   return environment;
 }
 
 async function assertSafeRuntimeFile(filePath) {
   const info = await lstat(filePath);
   const uid = process.getuid?.();
-  if (
-    !info.isFile() ||
-    (uid !== undefined && info.uid !== uid) ||
-    (info.mode & 0o022) !== 0
-  ) {
+  const wrongOwner = uid !== undefined && info.uid !== uid;
+  if (!info.isFile() || wrongOwner || (info.mode & 0o022) !== 0) {
     throw new Error(`Unsafe runtime file: ${filePath}`);
   }
 }
@@ -106,64 +81,45 @@ async function assertSafeRuntimeFile(filePath) {
 async function verifyRuntimeFiles(sourceDirectory) {
   await Promise.all(
     RUNTIME_FILES.map((name) =>
-      assertSafeRuntimeFile(path.join(sourceDirectory, name)),
-    ),
+      assertSafeRuntimeFile(path.join(sourceDirectory, name))),
   );
 }
 
 async function verifyExecutable(executable) {
   const info = await lstat(executable);
-  if (
-    !info.isFile() ||
-    (info.mode & 0o111) === 0
-  ) {
+  if (!info.isFile() || (info.mode & 0o111) === 0) {
     throw new Error(`ChatGPT executable not found: ${executable}`);
   }
 }
 
-async function verifySignature(profile = PROFILE) {
+async function verifySignature() {
   await execFileAsync("/usr/bin/codesign", [
-    "--verify",
-    "--deep",
-    "--strict",
-    "--verbose=2",
-    profile.appPath,
+    "--verify", "--deep", "--strict", "--verbose=2", PROFILE.appPath,
   ]);
-  const { stderr } = await execFileAsync("/usr/bin/codesign", [
-    "-d",
-    "--verbose=4",
-    profile.appPath,
-  ]);
-  if (
-    !stderr.includes(`Identifier=${profile.appIdentifier}`) ||
-    !stderr.includes(`TeamIdentifier=${profile.appTeamIdentifier}`) ||
-    !stderr.includes("flags=0x10000(runtime)")
-  ) {
+  const { stderr } = await execFileAsync(
+    "/usr/bin/codesign",
+    ["-d", "--verbose=4", PROFILE.appPath],
+  );
+  const correctIdentity =
+    stderr.includes(`Identifier=${PROFILE.appIdentifier}`) &&
+    stderr.includes(`TeamIdentifier=${PROFILE.appTeamIdentifier}`) &&
+    stderr.includes("flags=0x10000(runtime)");
+  if (!correctIdentity) {
     throw new Error("ChatGPT is not the expected signed OpenAI app");
   }
 }
 
 async function findRunningChatGPT() {
   const { stdout } = await execFileAsync("/bin/ps", [
-    "-axo",
-    "pid=,command=",
+    "-axo", "pid=,command=",
   ]);
-  const matches = [];
-  for (const line of stdout.split("\n")) {
-    const match = line.match(/^\s*(\d+)\s+(.+)$/);
-    if (
-      match &&
-      /^\/Applications\/ChatGPT(?:-[^/]+)?\.app\/Contents\/MacOS\/ChatGPT(?:\s|$)/.test(
-        match[2],
-      )
-    ) {
-      matches.push({
-        pid: Number(match[1]),
-        command: match[2],
-      });
-    }
-  }
-  return matches;
+  const pattern =
+    /^\/Applications\/ChatGPT(?:-[^/]+)?\.app\/Contents\/MacOS\/ChatGPT(?:\s|$)/;
+  return stdout
+    .split("\n")
+    .map((line) => line.match(/^\s*(\d+)\s+(.+)$/))
+    .filter((match) => match && pattern.test(match[2]))
+    .map((match) => ({ pid: Number(match[1]), command: match[2] }));
 }
 
 function waitForSpawn(child) {
@@ -181,63 +137,47 @@ async function main(argumentsList = process.argv.slice(2)) {
     throw new Error("Node.js 20 or newer is required");
   }
 
-  const { appArguments, checkOnly } =
-    parseArguments(argumentsList);
+  const { appArguments, checkOnly } = parseArguments(argumentsList);
   const sourceDirectory = __dirname;
   const preloadPath = path.join(sourceDirectory, "preload.cjs");
-  const paths = appPaths();
+  const executable = path.join(PROFILE.appPath, "Contents/MacOS/ChatGPT");
 
   await verifyRuntimeFiles(sourceDirectory);
-  await verifyExecutable(paths.executable);
+  await verifyExecutable(executable);
   await verifySignature();
 
   const running = await findRunningChatGPT();
   if (running.length > 0) {
+    const pids = running.map(({ pid }) => pid).join(", ");
     const error = new Error(
-      `ChatGPT is already running (PID ${running
-        .map(({ pid }) => pid)
-        .join(", ")}). Quit it completely first.`,
-    );
+      `ChatGPT is already running (PID ${pids}). Quit it completely first.`);
     error.exitCode = 2;
     throw error;
   }
-
   if (checkOnly) {
     process.stdout.write("Ready for signed stock ChatGPT.\n");
     return;
   }
 
-  const child = spawn(paths.executable, appArguments, {
+  const child = spawn(executable, appArguments, {
     detached: true,
-    env: createEnvironment(process.env, {
-      preloadPath,
-    }),
+    env: createEnvironment(process.env, { preloadPath }),
     stdio: "ignore",
   });
   await waitForSpawn(child);
   child.unref();
-
   process.stdout.write(
-    [
-      "Launched signed stock ChatGPT with AirPods Codex mute control.",
-      "Launch ChatGPT normally next time to revert.",
-      "",
-    ].join("\n"),
+    "Launched signed stock ChatGPT with AirPods Codex mute control.\n" +
+      "Launch ChatGPT normally next time to revert.\n",
   );
 }
 
 if (require.main === module) {
   main().catch((error) => {
-    process.stderr.write(
-      `${error instanceof Error ? error.message : String(error)}\n`,
-    );
-    process.exitCode =
-      Number.isInteger(error?.exitCode) ? error.exitCode : 1;
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exitCode = Number.isInteger(error?.exitCode) ? error.exitCode : 1;
   });
 }
 
-module.exports = {
-  createEnvironment,
-  parseArguments,
-  withDisabledFeature,
-};
+module.exports = { createEnvironment, parseArguments, withDisabledFeature };

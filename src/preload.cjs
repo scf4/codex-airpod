@@ -3,64 +3,274 @@
 const Module = require("node:module");
 const { isMainThread } = require("node:worker_threads");
 const {
-  installCoordinatorCapture,
-} = require("./coordinator.cjs");
-const {
   createNativeGestureAdapter,
-} = require("./native-gesture.cjs");
-const {
   createVoiceMuteLifecycle,
-} = require("./lifecycle.cjs");
+} = require("./airpods.cjs");
 const {
-  installRendererAssetTransform,
-} = require("./renderer.cjs");
+  CAPTURE_SYMBOL_KEY,
+  isMainBundle,
+  isRendererBundle,
+  patchMainSource,
+  patchRendererSource,
+} = require("./transforms.cjs");
 
 const AUDIO_SERVICE_FEATURE = "AudioServiceOutOfProcess";
-const ELECTRON_HOOK = Symbol.for(
-  "airpods-codex-mute.electron-hook.v1",
-);
-const APP_STATE = Symbol.for(
-  "airpods-codex-mute.app-state.v1",
-);
+const CAPTURE_SYMBOL = Symbol.for(CAPTURE_SYMBOL_KEY);
+const HOOK_MARKER = Symbol.for("airpods-codex-mute.compile-hook.v1");
 
-function stripManagedRequire(options, filename = __filename) {
-  if (typeof options !== "string" || options.length === 0) {
-    return options;
+function safely(action, fallback = false) {
+  try {
+    return action();
+  } catch {
+    return fallback;
   }
-  for (const managed of [
-    `--require=${JSON.stringify(filename)}`,
-    `--require=${filename}`,
-  ]) {
-    const index = options.indexOf(managed);
-    if (index < 0) continue;
-    const before = options.slice(0, index);
-    const after = options.slice(index + managed.length);
-    if ((before && !/\s$/.test(before)) || (after && !/^\s/.test(after))) {
-      continue;
-    }
-    return `${before}${after}`.trim().replace(/\s{2,}/g, " ") || undefined;
-  }
-  return options;
 }
 
-function chromiumFeatures(
-  app,
-  switchName,
-  argumentsList = process.argv,
-) {
-  const values = [];
-  const value = app?.commandLine?.getSwitchValue?.(switchName);
-  if (typeof value === "string" && value) values.push(value);
-  const prefix = `--${switchName}=`;
-  for (const argument of argumentsList) {
-    if (typeof argument === "string" && argument.startsWith(prefix)) {
-      values.push(argument.slice(prefix.length));
+function returnsTrue(action) {
+  return safely(action) === true;
+}
+
+function disposeSafely(value) {
+  safely(() => value?.dispose?.());
+}
+
+function isVoiceCoordinator(value) {
+  return Boolean(
+    value &&
+      typeof value.getSnapshot === "function" &&
+      typeof value.control === "function",
+  );
+}
+
+function isTargetRequest(request) {
+  return (
+    typeof request?.url === "string" &&
+    request.url.startsWith("app://-/assets/") &&
+    isRendererBundle(request.url)
+  );
+}
+
+function installCoordinatorCapture({
+  moduleApi = Module,
+  globalObject = globalThis,
+  patchSource = patchMainSource,
+  timeoutMs = 30_000,
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout,
+} = {}) {
+  const prototype = moduleApi?.prototype;
+  if (
+    !prototype ||
+    typeof prototype._compile !== "function" ||
+    prototype[HOOK_MARKER]
+  ) {
+    throw new Error("Coordinator compile hook is unavailable");
+  }
+  if (Object.hasOwn(globalObject, CAPTURE_SYMBOL)) {
+    throw new Error("Coordinator capture slot is already occupied");
+  }
+
+  const originalCompile = prototype._compile;
+  let accepting = true;
+  let coordinator = null;
+  let timer = null;
+
+  function restoreHook() {
+    if (prototype._compile === compileWithCapture) {
+      prototype._compile = originalCompile;
+    }
+    safely(() => delete prototype[HOOK_MARKER]);
+  }
+
+  function removeSlot() {
+    if (globalObject[CAPTURE_SYMBOL] === receiveCoordinator) {
+      safely(() => delete globalObject[CAPTURE_SYMBOL]);
     }
   }
+
+  function finish() {
+    if (!accepting) return;
+    accepting = false;
+    restoreHook();
+    removeSlot();
+    if (timer !== null) clearTimeoutFn(timer);
+    timer = null;
+  }
+
+  function receiveCoordinator(candidate) {
+    if (!accepting) return;
+    if (isVoiceCoordinator(candidate)) coordinator = candidate;
+    finish();
+  }
+
+  function compileWithCapture(source, filename) {
+    if (!isMainBundle(filename)) {
+      return Reflect.apply(originalCompile, this, arguments);
+    }
+
+    restoreHook();
+    const patch = safely(() => patchSource(source, filename), null);
+    if (!patch?.ok) finish();
+    return Reflect.apply(
+      originalCompile,
+      this,
+      patch?.ok ? [patch.source, filename] : arguments,
+    );
+  }
+
+  try {
+    Object.defineProperty(globalObject, CAPTURE_SYMBOL, {
+      value: receiveCoordinator,
+      configurable: true,
+    });
+    prototype._compile = compileWithCapture;
+    Object.defineProperty(prototype, HOOK_MARKER, {
+      value: true,
+      configurable: true,
+    });
+    timer = setTimeoutFn(() => {
+      timer = null;
+      finish();
+    }, timeoutMs);
+    timer?.unref?.();
+  } catch (error) {
+    finish();
+    throw error;
+  }
+
+  return {
+    dispose() {
+      finish();
+      coordinator = null;
+    },
+    getCoordinator: () => coordinator,
+  };
+}
+
+function installRendererAssetTransform(electron, { onFailure } = {}) {
+  const protocol = electron?.protocol;
+  if (typeof protocol?.handle !== "function") {
+    throw new TypeError("Electron protocol.handle is unavailable");
+  }
+
+  const originalHandle = protocol.handle;
+  let disposed = false;
+  let failed = false;
+  let failureReported = false;
+  let resolveReady;
+  const ready = new Promise((resolve) => {
+    resolveReady = resolve;
+  });
+
+  function reportFailure(reason) {
+    failed = true;
+    resolveReady(false);
+    if (failureReported) return;
+    failureReported = true;
+    safely(() => onFailure?.(reason));
+  }
+
+  function restoreHandle() {
+    if (protocol.handle === handleWithTransform) {
+      protocol.handle = originalHandle;
+    }
+  }
+
+  function handleWithTransform(scheme, stockHandler) {
+    if (scheme !== "app" || typeof stockHandler !== "function") {
+      return Reflect.apply(originalHandle, this, arguments);
+    }
+    restoreHandle();
+    const transformedHandler = async (request) => {
+      let stockResponse;
+      try {
+        stockResponse = await stockHandler(request);
+      } catch (error) {
+        if (!disposed && isTargetRequest(request)) {
+          reportFailure("stock-handler-failed");
+        }
+        throw error;
+      }
+
+      if (disposed || !isTargetRequest(request) || failed) return stockResponse;
+
+      try {
+        if (
+          typeof stockResponse?.clone !== "function" ||
+          typeof stockResponse?.text !== "function"
+        ) {
+          reportFailure("invalid-stock-response");
+          return stockResponse;
+        }
+
+        const source = await stockResponse.clone().text();
+        if (disposed || failed) return stockResponse;
+        const result = patchRendererSource(source, request.url);
+        if (!result.ok) {
+          reportFailure(result.reason);
+          return stockResponse;
+        }
+        const headers = new Headers(stockResponse.headers);
+        headers.delete("content-length");
+        const replacement = new Response(Buffer.from(result.source, "utf8"), {
+          headers,
+          status: stockResponse.status,
+          statusText: stockResponse.statusText,
+        });
+        resolveReady(true);
+        return replacement;
+      } catch {
+        reportFailure("renderer-transform-failed");
+        return stockResponse;
+      }
+    };
+    const delegated = [...arguments];
+    delegated[1] = transformedHandler;
+
+    try {
+      return Reflect.apply(originalHandle, this, delegated);
+    } catch (error) {
+      reportFailure("app-protocol-registration-failed");
+      throw error;
+    }
+  }
+
+  try {
+    protocol.handle = handleWithTransform;
+  } catch (error) {
+    reportFailure("protocol-hook-failed");
+    throw error;
+  }
+
+  return {
+    ready,
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      restoreHandle();
+      resolveReady(false);
+    },
+  };
+}
+
+function chromiumFeatures(app, switchName, argumentsList = process.argv) {
+  const prefix = `--${switchName}=`;
+  const argumentValues = argumentsList
+    .filter(
+      (value) =>
+        typeof value === "string" && value.startsWith(prefix),
+    )
+    .map((value) => value.slice(prefix.length));
+  const values = [
+    app?.commandLine?.getSwitchValue?.(switchName),
+    ...argumentValues,
+  ];
+
   return new Set(
     values
-      .flatMap((item) => item.split(","))
-      .map((item) => item.trim())
+      .filter((value) => typeof value === "string")
+      .flatMap((value) => value.split(","))
+      .map((value) => value.trim())
       .filter(Boolean),
   );
 }
@@ -73,64 +283,55 @@ function isElectronApi(value) {
   );
 }
 
-function observeElectron(
-  onElectron,
-  { moduleApi = Module } = {},
-) {
+function observeElectron(onElectron, { moduleApi = Module } = {}) {
   if (
     typeof onElectron !== "function" ||
-    typeof moduleApi?._load !== "function" ||
-    moduleApi[ELECTRON_HOOK]
+    typeof moduleApi?._load !== "function"
   ) {
     return false;
   }
 
   const originalLoad = moduleApi._load;
-  function loadWithObserver(request, parent, isMain) {
+  let delivered = false;
+
+  function loadWithObserver(request) {
     const loaded = Reflect.apply(originalLoad, this, arguments);
     if (
+      !delivered &&
       (request === "electron" || request === "electron/main") &&
       isElectronApi(loaded)
     ) {
+      delivered = true;
       if (moduleApi._load === loadWithObserver) {
-        moduleApi._load = originalLoad;
+        safely(() => {
+          moduleApi._load = originalLoad;
+        });
       }
-      try {
-        onElectron(loaded);
-      } catch {
-        // A rejected attachment cannot affect stock Electron startup.
-      }
+      safely(() => onElectron(loaded));
     }
     return loaded;
   }
 
-  try {
+  const installed = returnsTrue(() => {
     moduleApi._load = loadWithObserver;
-    Object.defineProperty(moduleApi, ELECTRON_HOOK, {
-      value: true,
-      configurable: false,
-    });
     return true;
-  } catch {
-    moduleApi._load = originalLoad;
-    return false;
+  });
+  if (!installed) {
+    safely(() => {
+      moduleApi._load = originalLoad;
+    });
   }
+  return installed;
 }
 
-function attachToElectron(
-  electron,
-  capture,
-  {
-    createNative = createNativeGestureAdapter,
-    createLifecycle = createVoiceMuteLifecycle,
-    installRenderer = installRendererAssetTransform,
-    argumentsList = process.argv,
-  } = {},
-) {
+function attachToElectron(electron, capture, {
+  createNative = createNativeGestureAdapter,
+  createLifecycle = createVoiceMuteLifecycle,
+  installRenderer = installRendererAssetTransform,
+  argumentsList = process.argv,
+} = {}) {
   if (!isElectronApi(electron)) return false;
   const { app } = electron;
-  if (app[APP_STATE]) return true;
-
   const disabled = chromiumFeatures(
     app,
     "disable-features",
@@ -145,138 +346,89 @@ function attachToElectron(
     !disabled.has(AUDIO_SERVICE_FEATURE) ||
     enabled.has(AUDIO_SERVICE_FEATURE)
   ) {
-    capture.dispose();
+    disposeSafely(capture);
     return false;
   }
 
-  const state = {
-    captureFailed: false,
-    captureFailureUnsubscribe: null,
-    lifecycle: null,
-    nativeGesture: null,
-    quitting: false,
-    rendererFailed: false,
-    rendererTransform: null,
-  };
-  function cleanup() {
-    if (state.quitting) return;
-    state.quitting = true;
-    state.captureFailureUnsubscribe?.();
-    state.captureFailureUnsubscribe = null;
-    disposeRuntime();
-    state.rendererTransform?.dispose?.();
-    state.rendererTransform = null;
-    capture.dispose();
-  }
+  let lifecycle = null;
+  let nativeGesture = null;
+  let quitting = false;
+  let rendererFailed = false;
+  let rendererTransform = null;
 
   function disposeRuntime() {
-    state.lifecycle?.dispose();
-    state.lifecycle = null;
-    state.nativeGesture?.dispose();
-    state.nativeGesture = null;
+    const retiring = [lifecycle, nativeGesture];
+    lifecycle = null;
+    nativeGesture = null;
+    retiring.forEach(disposeSafely);
   }
 
-  if (typeof capture.onFailure === "function") {
-    state.captureFailureUnsubscribe = capture.onFailure(() => {
-      state.captureFailed = true;
-      disposeRuntime();
+  function cleanup() {
+    if (quitting) return;
+    quitting = true;
+    disposeRuntime();
+    const oldRendererTransform = rendererTransform;
+    rendererTransform = null;
+    disposeSafely(oldRendererTransform);
+    disposeSafely(capture);
+  }
+
+  async function startRuntime() {
+    const rendererReady = await rendererTransform?.ready;
+    if (!rendererReady || quitting || rendererFailed) return;
+
+    const createdNative = await createNative({
+      onRequest: (requested) =>
+        lifecycle?.handleRequest(requested) === true,
     });
+    if (quitting || rendererFailed) {
+      disposeSafely(createdNative);
+      return;
+    }
+    nativeGesture = createdNative;
+    lifecycle = createLifecycle(
+      {
+        getCoordinator: () => capture.getCoordinator(),
+        nativeGesture,
+      },
+    );
+    if (lifecycle.start() !== true) cleanup();
   }
 
-  let rendererTransform;
   try {
     rendererTransform = installRenderer(electron, {
       onFailure() {
-        state.rendererFailed = true;
+        rendererFailed = true;
         disposeRuntime();
       },
     });
-    state.rendererTransform = rendererTransform;
+    if (
+      typeof rendererTransform?.ready?.then !== "function" ||
+      typeof rendererTransform.dispose !== "function"
+    ) {
+      cleanup();
+      return false;
+    }
+
+    app.on("will-quit", cleanup);
+    void Promise.resolve(app.whenReady()).then(startRuntime).catch(cleanup);
+    return true;
   } catch {
     cleanup();
     return false;
   }
-  if (
-    typeof rendererTransform?.ready?.then !== "function" ||
-    typeof rendererTransform.dispose !== "function"
-  ) {
-    cleanup();
-    return false;
-  }
-
-  Object.defineProperty(app, APP_STATE, {
-    value: state,
-    configurable: false,
-  });
-  app.on("will-quit", cleanup);
-
-  void app
-    .whenReady()
-    .then(async () => {
-      const rendererReady = await rendererTransform.ready;
-      if (
-        !rendererReady ||
-        state.quitting ||
-        state.captureFailed ||
-        state.rendererFailed ||
-        capture.getStatus() === "failed"
-      ) {
-        return;
-      }
-
-      let lifecycle = null;
-      const nativeGesture = await createNative({
-        onRequest: (requested) =>
-          lifecycle?.handleRequest(requested) === true,
-      });
-      if (
-        state.quitting ||
-        state.captureFailed ||
-        state.rendererFailed
-      ) {
-        nativeGesture.dispose();
-        return;
-      }
-
-      state.nativeGesture = nativeGesture;
-      lifecycle = createLifecycle({
-        getCoordinator: () => capture.getCoordinator(),
-        nativeGesture,
-      });
-      state.lifecycle = lifecycle;
-      lifecycle.start();
-    })
-    .catch(() => {
-      cleanup();
-    });
-
-  return true;
 }
 
-function runPreload({
-  moduleApi = Module,
-  globalObject = globalThis,
-} = {}) {
-  const remaining = stripManagedRequire(
-    process.env.NODE_OPTIONS,
-    __filename,
-  );
-  if (remaining === undefined) delete process.env.NODE_OPTIONS;
-  else process.env.NODE_OPTIONS = remaining;
-
+function runPreload({ moduleApi = Module, globalObject = globalThis } = {}) {
+  delete process.env.NODE_OPTIONS;
   try {
-    const capture = installCoordinatorCapture({
-      globalObject,
-      moduleApi,
-    });
-    if (
-      !observeElectron(
-        (electron) =>
-          attachToElectron(electron, capture),
-        { moduleApi },
-      )
-    ) {
-      capture.dispose();
+    const capture = installCoordinatorCapture({ globalObject, moduleApi });
+    const observed = observeElectron(
+      (electron) => attachToElectron(electron, capture),
+      { moduleApi },
+    );
+    if (!observed) {
+      disposeSafely(capture);
       return false;
     }
     return true;
@@ -296,6 +448,8 @@ if (
 module.exports = {
   attachToElectron,
   chromiumFeatures,
+  installCoordinatorCapture,
+  installRendererAssetTransform,
   observeElectron,
-  stripManagedRequire,
+  runPreload,
 };
