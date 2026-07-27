@@ -1,8 +1,8 @@
 {
   "name": "codex-airpod",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
-  "description": "Control Codex Voice mute with an AirPods gesture",
+  "description": "Use AirPods to mute and unmute Codex Voice in ChatGPT for macOS",
   "type": "commonjs",
   "engines": {
     "node": ">=20"
