@@ -3,6 +3,7 @@
   "version": "0.1.1",
   "private": true,
   "description": "Use AirPods to mute and unmute Codex Voice in ChatGPT for macOS",
+  "license": "MIT",
   "type": "commonjs",
   "engines": {
     "node": ">=20"
