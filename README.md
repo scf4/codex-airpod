@@ -13,8 +13,11 @@ git clone https://github.com/scf4/codex-airpod.git
 cd codex-airpod
 ```
 
-Fully quit ChatGPT before using the Terminal command. Then either run
-`npm run launch` in Terminal, or double-click `launch.command` in Finder.
+Fully quit ChatGPT, then run:
+
+```sh
+npm run launch
+```
 
 Start Codex Voice and use the configured AirPods mute gesture.
 
@@ -24,7 +27,7 @@ Quit ChatGPT and open `/Applications/ChatGPT.app` normally.
 
 Nothing is installed or written into the app bundle, Login Items,
 LaunchAgents, or system configuration. The shim applies only to ChatGPT
-started by either launch option.
+started by this command.
 
 ## Development
 

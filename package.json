@@ -10,7 +10,7 @@
   },
   "scripts": {
     "launch": "node src/launch.cjs",
-    "check": "set -e; for file in src/*.cjs test/*.cjs; do node --check \"$file\"; done; zsh -n launch.command",
+    "check": "set -e; for file in src/*.cjs test/*.cjs; do node --check \"$file\"; done",
     "test": "node --test test/*.test.cjs"
   }
 }

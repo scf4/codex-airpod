@@ -7,8 +7,6 @@ const { promisify } = require("node:util");
 
 const execFileAsync = promisify(execFile);
 const AUDIO_SERVICE_FEATURE = "AudioServiceOutOfProcess";
-const INTERNAL_RELAUNCH_ARGUMENT = "--quit-running";
-const QUIT_TIMEOUT_MS = 10_000;
 const PROFILE = Object.freeze({
   appPath: "/Applications/ChatGPT.app",
   appIdentifier: "com.openai.codex",
@@ -54,23 +52,12 @@ function withDisabledFeature(args, feature) {
 
 function parseArguments(argumentsList) {
   const checkOnly = argumentsList.includes("--check");
-  const quitRunning = argumentsList.includes(INTERNAL_RELAUNCH_ARGUMENT);
-  const forwarded = argumentsList.filter(
-    (argument) =>
-      argument !== "--check" &&
-      argument !== INTERNAL_RELAUNCH_ARGUMENT,
-  );
-  if (checkOnly && quitRunning) {
-    throw new Error(
-      `${INTERNAL_RELAUNCH_ARGUMENT} cannot be combined with --check`,
-    );
-  }
+  const forwarded = argumentsList.filter((argument) => argument !== "--check");
   if (hasFeature(forwarded, "enable-features", AUDIO_SERVICE_FEATURE)) {
     throw new Error(`Cannot enable ${AUDIO_SERVICE_FEATURE} in AirPods mute mode`);
   }
   return {
     checkOnly,
-    quitRunning,
     appArguments: withDisabledFeature(forwarded, AUDIO_SERVICE_FEATURE),
   };
 }
@@ -135,34 +122,6 @@ async function findRunningChatGPT() {
     .map((match) => ({ pid: Number(match[1]), command: match[2] }));
 }
 
-async function requestChatGPTQuit() {
-  await execFileAsync("/usr/bin/osascript", [
-    "-e",
-    `tell application id "${PROFILE.appIdentifier}" to quit`,
-  ]);
-}
-
-function delay(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-async function waitForChatGPTExit({
-  findRunning = findRunningChatGPT,
-  now = Date.now,
-  sleep = delay,
-  timeoutMs = QUIT_TIMEOUT_MS,
-  pollIntervalMs = 100,
-} = {}) {
-  const startedAt = now();
-  while ((await findRunning()).length > 0) {
-    const remaining = timeoutMs - (now() - startedAt);
-    if (remaining <= 0) {
-      throw new Error("ChatGPT did not quit within 10 seconds");
-    }
-    await sleep(Math.min(pollIntervalMs, remaining));
-  }
-}
-
 function waitForSpawn(child) {
   return new Promise((resolve, reject) => {
     child.once("spawn", resolve);
@@ -178,8 +137,7 @@ async function main(argumentsList = process.argv.slice(2)) {
     throw new Error("Node.js 20 or newer is required");
   }
 
-  const { appArguments, checkOnly, quitRunning } =
-    parseArguments(argumentsList);
+  const { appArguments, checkOnly } = parseArguments(argumentsList);
   const sourceDirectory = __dirname;
   const preloadPath = path.join(sourceDirectory, "preload.cjs");
   const executable = path.join(PROFILE.appPath, "Contents/MacOS/ChatGPT");
@@ -190,15 +148,11 @@ async function main(argumentsList = process.argv.slice(2)) {
 
   const running = await findRunningChatGPT();
   if (running.length > 0) {
-    if (!quitRunning) {
-      const pids = running.map(({ pid }) => pid).join(", ");
-      const error = new Error(
-        `ChatGPT is already running (PID ${pids}). Quit it completely first.`);
-      error.exitCode = 2;
-      throw error;
-    }
-    await requestChatGPTQuit();
-    await waitForChatGPTExit();
+    const pids = running.map(({ pid }) => pid).join(", ");
+    const error = new Error(
+      `ChatGPT is already running (PID ${pids}). Quit it completely first.`);
+    error.exitCode = 2;
+    throw error;
   }
   if (checkOnly) {
     process.stdout.write("Ready for signed stock ChatGPT.\n");
@@ -226,10 +180,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = {
-  INTERNAL_RELAUNCH_ARGUMENT,
-  createEnvironment,
-  parseArguments,
-  waitForChatGPTExit,
-  withDisabledFeature,
-};
+module.exports = { createEnvironment, parseArguments, withDisabledFeature };
