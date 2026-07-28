@@ -1,6 +1,6 @@
 "use strict";
 
-const { execFile, spawn } = require("node:child_process");
+const { execFile } = require("node:child_process");
 const { lstat } = require("node:fs/promises");
 const path = require("node:path");
 const { promisify } = require("node:util");
@@ -122,10 +122,26 @@ async function findRunningChatGPT() {
     .map((match) => ({ pid: Number(match[1]), command: match[2] }));
 }
 
-function waitForSpawn(child) {
-  return new Promise((resolve, reject) => {
-    child.once("spawn", resolve);
-    child.once("error", reject);
+async function launchChatGPT(
+  appArguments,
+  {
+    baseEnvironment = process.env,
+    executeFile = execFileAsync,
+    preloadPath,
+  },
+) {
+  const environment = createEnvironment(baseEnvironment, { preloadPath });
+  const nodeOptions = environment.NODE_OPTIONS;
+  delete environment.NODE_OPTIONS;
+
+  await executeFile("/usr/bin/open", [
+    "-n",
+    "-a", PROFILE.appPath,
+    "--env", `NODE_OPTIONS=${nodeOptions}`,
+    "--args", ...appArguments,
+  ], {
+    encoding: "utf8",
+    env: environment,
   });
 }
 
@@ -159,13 +175,7 @@ async function main(argumentsList = process.argv.slice(2)) {
     return;
   }
 
-  const child = spawn(executable, appArguments, {
-    detached: true,
-    env: createEnvironment(process.env, { preloadPath }),
-    stdio: "ignore",
-  });
-  await waitForSpawn(child);
-  child.unref();
+  await launchChatGPT(appArguments, { preloadPath });
   process.stdout.write(
     "Launched signed stock ChatGPT with AirPods Codex mute control.\n" +
       "Launch ChatGPT normally next time to revert.\n",
@@ -180,4 +190,9 @@ if (require.main === module) {
   });
 }
 
-module.exports = { createEnvironment, parseArguments, withDisabledFeature };
+module.exports = {
+  createEnvironment,
+  launchChatGPT,
+  parseArguments,
+  withDisabledFeature,
+};

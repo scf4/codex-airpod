@@ -6,6 +6,7 @@ const path = require("node:path");
 const { describe, test } = require("node:test");
 const {
   createEnvironment,
+  launchChatGPT,
   parseArguments,
   withDisabledFeature,
 } = require("../src/launch.cjs");
@@ -70,6 +71,67 @@ describe("launch arguments and environment", () => {
     );
     assert.equal(environment.ELECTRON_RUN_AS_NODE, undefined);
     assert.equal(environment.KEEP_ME, "yes");
+  });
+});
+
+describe("Launch Services startup", () => {
+  test("passes exact per-launch state and awaits acceptance", async () => {
+    let invocation;
+    let release;
+    let completed = false;
+    const pending = new Promise((resolve) => {
+      release = resolve;
+    });
+
+    const launch = launchChatGPT(
+      ["--example=two words", "plain argument"],
+      {
+        baseEnvironment: {
+          ELECTRON_RUN_AS_NODE: "1",
+          KEEP_ME: "yes",
+          NODE_OPTIONS: "--require=/tmp/other.cjs",
+        },
+        executeFile: async (...argumentsList) => {
+          invocation = argumentsList;
+          await pending;
+          completed = true;
+        },
+        preloadPath: "/safe path/preload.cjs",
+      },
+    );
+
+    await Promise.resolve();
+    assert.equal(completed, false);
+    assert.equal(invocation[0], "/usr/bin/open");
+    assert.deepEqual(invocation[1], [
+      "-n",
+      "-a", "/Applications/ChatGPT.app",
+      "--env", 'NODE_OPTIONS=--require="/safe path/preload.cjs"',
+      "--args", "--example=two words", "plain argument",
+    ]);
+    assert.deepEqual(invocation[2], {
+      encoding: "utf8",
+      env: { KEEP_ME: "yes" },
+    });
+
+    release();
+    await launch;
+    assert.equal(completed, true);
+  });
+
+  test("propagates Launch Services failures", async () => {
+    const failure = new Error("open failed");
+
+    await assert.rejects(
+      launchChatGPT([], {
+        baseEnvironment: {},
+        executeFile: async () => {
+          throw failure;
+        },
+        preloadPath: "/safe/preload.cjs",
+      }),
+      (error) => error === failure,
+    );
   });
 });
 
@@ -153,6 +215,28 @@ describe("runtime architecture and forbidden behavior", () => {
       "app.asar.unpacked",
     ]) {
       assert.equal(allSource.includes(forbidden), false);
+    }
+  });
+
+  test("uses Launch Services without direct spawn or persistent state", () => {
+    const launchSource = sources.find(
+      ({ name }) => name === "launch.cjs",
+    )?.source;
+    assert.equal(typeof launchSource, "string");
+    assert.match(launchSource, /executeFile\("\/usr\/bin\/open"/);
+    for (const forbidden of [
+      "detached: true",
+      "launchctl",
+      "LSEnvironment",
+      "spawn(",
+      "unref(",
+      "waitForSpawn",
+    ]) {
+      assert.equal(
+        launchSource.includes(forbidden),
+        false,
+        `forbidden launch path: ${forbidden}`,
+      );
     }
   });
 });
