@@ -512,6 +512,7 @@ function rendererSource({
   command = "n",
   conversation = "t",
   error = "e",
+  feedback = null,
   guard = "up",
   local = "p",
   main = "_",
@@ -529,6 +530,10 @@ function rendererSource({
   return (
     `let ${bridge}=null;` +
     `function ${guard}(){return{u(){},e:null,d(){}}}` +
+    (feedback == null
+      ? ""
+      : `const feedbackCalls=[];function ${feedback}(e){` +
+        `feedbackCalls.push(e)}`) +
     `class Claim{${claim}=\`claim\`;${cache}=null;` +
     `publish(${payload}){try{var ${scope}=${guard}();` +
     `if(this.${claim}==null)return;let ${previous}=this.${cache};` +
@@ -562,6 +567,7 @@ function rendererSource({
     `applyRealtimeMicrophoneMuteState(${store},${muted}){` +
     `this.runtime?.setInputMuted(${muted}),` +
     `${store}.set(${microphoneAtom},${muted}),` +
+    (feedback == null ? "" : `${feedback}(${muted}),`) +
     `this.publishRealtimeVoiceHostState(${store})}` +
     `handleRealtimeVoiceHostControl(${store},t,${command}){` +
     `if(this.conversationId===t)switch(${command}.type){` +
@@ -596,6 +602,9 @@ function rendererSource({
     `control(e){owner.handleRealtimeVoiceHostControl(` +
     `stateStore,\`conversation\`,e)},` +
     `getInputCalls(){return[...owner.runtime.inputCalls]},` +
+    `getFeedbackCalls(){return` +
+    (feedback == null ? `[]` : `[...feedbackCalls]`) +
+    `},` +
     `getMuted(){return stateStore.get(${microphoneAtom})},` +
     `microphone(e){owner.applyRealtimeMicrophoneMuteState(` +
     `stateStore,e)},` +
@@ -851,6 +860,44 @@ describe("renderer source transform", () => {
       type: "set-microphone-muted", muted: true,
     }), /track setter failed/);
     assert.equal(throwing.getMuted(), false);
+  });
+
+  test("renderer patch preserves stock microphone feedback", () => {
+    const source = rendererSource({ feedback: "playFeedback" });
+    const result = patchRendererSource(source, TARGET_URL);
+    assert.equal(result.ok, true, result.reason);
+    assert.match(
+      result.source,
+      /\.set\(SX,t\),playFeedback\(t\),this\.publishRealtimeVoiceHostState\(e,!0\)/,
+    );
+
+    const fixture = evaluate(result.source);
+    fixture.control({
+      type: "set-microphone-muted",
+      muted: false,
+    });
+    fixture.microphone(true);
+    assert.deepEqual(
+      Array.from(fixture.getFeedbackCalls()),
+      [false, true],
+    );
+
+    for (const incompatible of [
+      source.replace(
+        "playFeedback(t),this.publishRealtimeVoiceHostState(e)",
+        "playFeedback(t),playFeedback(t)," +
+          "this.publishRealtimeVoiceHostState(e)",
+      ),
+      source.replace("playFeedback(t)", "playFeedback(!t)"),
+      source.replace(
+        "playFeedback(t),this.publishRealtimeVoiceHostState(e)",
+        "this.publishRealtimeVoiceHostState(e),playFeedback(t)",
+      ),
+    ]) {
+      const rejected = patchRendererSource(incompatible, TARGET_URL);
+      assert.equal(rejected.ok, false);
+      assert.equal(rejected.source, incompatible);
+    }
   });
 
   test("renderer bundle matcher accepts only the intended asset family", () => {

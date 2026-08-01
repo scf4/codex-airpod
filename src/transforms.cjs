@@ -43,7 +43,7 @@ const PUBLISHER_PATTERN = new RegExp(
   String.raw`publish\((?<payload>${IDENTIFIER})\)\{try\{var (?<scope>${IDENTIFIER})=(?<guard>${IDENTIFIER})\(\);if\(this\.(?<claim>${PRIVATE_IDENTIFIER})==null\)return;let (?<previous>${IDENTIFIER})=this\.(?<cache>${PRIVATE_IDENTIFIER});if\(\k<previous>!=null&&\k<previous>\.activity===\k<payload>\.activity&&\k<previous>\.microphoneMuted===\k<payload>\.microphoneMuted&&\k<previous>\.outputMuted===\k<payload>\.outputMuted&&\k<previous>\.phase===\k<payload>\.phase\)return;this\.\k<cache>=\k<payload>,\k<scope>\.u\((?<bridge>${IDENTIFIER})\?\.realtimeVoice\?\.publish\(this\.\k<claim>,\k<payload>\)\)\}catch\((?<error>${IDENTIFIER})\)\{\k<scope>\.e=\k<error>\}finally\{\k<scope>\.d\(\)\}\}`,
 );
 const MICROPHONE_COMMIT_PATTERN = new RegExp(
-  String.raw`applyRealtimeMicrophoneMuteState\((?<store>${IDENTIFIER}),(?<muted>${IDENTIFIER})\)\{this\.runtime\?\.setInputMuted\(\k<muted>\),\k<store>\.set\((?<microphoneAtom>${IDENTIFIER}),\k<muted>\),this\.publishRealtimeVoiceHostState\(\k<store>\)\}`,
+  String.raw`applyRealtimeMicrophoneMuteState\((?<store>${IDENTIFIER}),(?<muted>${IDENTIFIER})\)\{this\.runtime\?\.setInputMuted\(\k<muted>\),\k<store>\.set\((?<microphoneAtom>${IDENTIFIER}),\k<muted>\),(?:(?<feedbackCall>${IDENTIFIER}\(\k<muted>\)),)?this\.publishRealtimeVoiceHostState\(\k<store>\)\}`,
 );
 const HOST_PUBLICATION_PATTERN = new RegExp(
   String.raw`publishRealtimeVoiceHostState\((?<store>${IDENTIFIER})\)\{let (?<phase>${IDENTIFIER})=\k<store>\.get\((?<phaseAtom>${IDENTIFIER})\);\k<phase>!==\x60inactive\x60&&\(this\.realtimeVoiceHostClaim\.publish\(\{activity:\k<store>\.get\((?<activityAtom>${IDENTIFIER})\),microphoneMuted:\k<store>\.get\((?<microphoneAtom>${IDENTIFIER})\),outputMuted:\k<store>\.get\((?<outputAtom>${IDENTIFIER})\),phase:\k<phase>\}\),this\.updateRealtimeVoiceOrbAudioStream\(\)\)\}`,
@@ -954,10 +954,14 @@ function patchRendererSource(source, filenameOrUrl) {
   ].join("");
 
   const commit = found.commit.groups;
+  const feedbackCall = commit.feedbackCall == null
+    ? ""
+    : `${commit.feedbackCall},`;
   const commitReplacement = [
     `applyRealtimeMicrophoneMuteState(${commit.store},${commit.muted}){`,
     `this.runtime.setInputMuted(${commit.muted}),`,
     `${commit.store}.set(${commit.microphoneAtom},${commit.muted}),`,
+    feedbackCall,
     `this.publishRealtimeVoiceHostState(${commit.store},!0)}`,
   ].join("");
 
